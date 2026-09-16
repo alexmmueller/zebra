@@ -53,8 +53,8 @@ use crate::methods::{
     hex_data::HexData,
     tests::utils::fake_history_tree,
     types::{
-        get_block_template::{BlockProposalResponse, GetBlockTemplateRequestMode},
-        long_poll::{LongPollId, LONG_POLL_ID_LENGTH},
+        get_block_template::{BlockProposalResponse, CoinbaseCache, GetBlockTemplateRequestMode},
+        long_poll::{LongPollId, LongPollInput, LONG_POLL_ID_LENGTH},
         peer_info::PeerInfo,
         subsidy::GetBlockSubsidyResponse,
     },
@@ -1080,8 +1080,13 @@ pub async fn test_mining_rpcs<State, ReadState>(
     let fake_min_time = DateTime32::from(1654008606);
     // nu5 block time + 12
     let fake_cur_time = DateTime32::from(1654008617);
-    // nu5 block time + 123
-    let fake_max_time = DateTime32::from(1654008728);
+    // Historical Testnet work is only usable at the full median-time cap, not after an expired
+    // abbreviated standard-difficulty interval.
+    let fake_max_time = DateTime32::from(if network.is_a_test_network() {
+        1654014005
+    } else {
+        1654008728
+    });
 
     // Use a valid fractional difficulty for snapshots
     let pow_limit = network.target_difficulty_limit();
@@ -1236,53 +1241,32 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .with_max_request_delay(Duration::MAX)
         .for_unit_tests();
 
+    let chain_info = GetBlockTemplateChainInfo {
+        expected_difficulty: fake_difficulty,
+        tip_height: fake_tip_height,
+        tip_hash: fake_tip_hash,
+        cur_time: fake_cur_time,
+        min_time: fake_min_time,
+        max_time: fake_max_time,
+        chain_history_root: fake_history_tree(network).hash(),
+        chain_value_pools: Default::default(),
+    };
+    let template = BlockTemplateResponse::from_transactions(
+        network,
+        &CoinbaseCache::default(),
+        &MinerParams::new(network, mining_conf.clone()).unwrap(),
+        &chain_info,
+        LongPollInput::new(fake_tip_height, fake_tip_hash, fake_max_time, []).generate_id(),
+        vec![],
+        None,
+    );
     let make_mock_read_state_request_handler = || {
         let mut read_state = read_state.clone();
-
         async move {
             read_state
-                .expect_request_that(|req| matches!(req, ReadRequest::ChainInfo))
-                .await
-                .respond(ReadResponse::ChainInfo(GetBlockTemplateChainInfo {
-                    expected_difficulty: fake_difficulty,
-                    tip_height: fake_tip_height,
-                    tip_hash: fake_tip_hash,
-                    cur_time: fake_cur_time,
-                    min_time: fake_min_time,
-                    max_time: fake_max_time,
-                    chain_history_root: fake_history_tree(network).hash(),
-                    chain_value_pools: Default::default(),
-                }));
-        }
-    };
-
-    // Template mode also checks that the built template still extends the committed tip.
-    let make_mock_template_read_state_handler = || {
-        let mut read_state = read_state.clone();
-        let chain_info = make_mock_read_state_request_handler();
-
-        async move {
-            chain_info.await;
-            read_state
-                .expect_request_that(|req| matches!(req, ReadRequest::Tip))
+                .expect_request(ReadRequest::Tip)
                 .await
                 .respond(ReadResponse::Tip(Some((fake_tip_height, fake_tip_hash))));
-        }
-    };
-
-    let make_mock_mempool_request_handler = || {
-        let mut mempool = mempool.clone();
-
-        async move {
-            mempool
-                .expect_request(mempool::Request::FullTransactions)
-                .await
-                .respond(mempool::Response::FullTransactions {
-                    transactions: vec![],
-                    transaction_dependencies: Default::default(),
-                    // tip hash needs to match chain info for long poll requests
-                    last_seen_tip_hash: fake_tip_hash,
-                });
         }
     };
 
@@ -1311,21 +1295,19 @@ pub async fn test_mining_rpcs<State, ReadState>(
     rpc_mock_state.template_clock = Some(Arc::new(std::sync::atomic::AtomicU32::new(
         fake_cur_time.timestamp(),
     )));
+    let (_templates, receiver) = watch::channel(Some(Arc::new(template)));
+    let (requests, _overrides) = mpsc::channel(1);
+    let rpc_mock_state = rpc_mock_state.with_block_templates(receiver, requests);
 
     // Basic variant (default mode and no extra features)
 
-    // Fake the ChainInfo, Tip and FullTransaction responses
-    let mock_read_state_request_handler = make_mock_template_read_state_handler();
-    let mock_mempool_request_handler = make_mock_mempool_request_handler();
+    // The consumer validates the published work against committed state.
+    let mock_read_state_request_handler = make_mock_read_state_request_handler();
 
     let get_block_template_fut = rpc_mock_state.get_block_template(None);
 
     let (get_block_template, ..) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(
-            get_block_template_fut,
-            mock_mempool_request_handler,
-            mock_read_state_request_handler,
-        )
+        tokio::join!(get_block_template_fut, mock_read_state_request_handler)
     })
     .await
     .unwrap_or_else(|_| panic!("basic getblocktemplate must not stall on {network}"));
@@ -1359,21 +1341,10 @@ pub async fn test_mining_rpcs<State, ReadState>(
         .parse()
         .expect("unexpected invalid LongPollId");
 
-    // The basic call published its template to the shared cache. Snapshot long polling on fallback
-    // work instead: a clone with overridden miner parameters has no template cache.
-    let mut rpc_long_poll = rpc_mock_state.clone();
-    let miner_params = rpc_long_poll
-        .gbt
-        .miner_params()
-        .expect("mining is configured")
-        .clone();
-    rpc_long_poll.gbt.set_miner_params(miner_params);
+    // The same publication serves a client with a different long-poll ID.
+    let mock_read_state_request_handler = make_mock_read_state_request_handler();
 
-    // Fake the ChainInfo, Tip and FullTransaction responses
-    let mock_read_state_request_handler = make_mock_template_read_state_handler();
-    let mock_mempool_request_handler = make_mock_mempool_request_handler();
-
-    let get_block_template_fut = rpc_long_poll.get_block_template(
+    let get_block_template_fut = rpc_mock_state.get_block_template(
         GetBlockTemplateParameters {
             long_poll_id: long_poll_id.into(),
             ..Default::default()
@@ -1382,11 +1353,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
     );
 
     let (get_block_template, ..) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(
-            get_block_template_fut,
-            mock_mempool_request_handler,
-            mock_read_state_request_handler,
-        )
+        tokio::join!(get_block_template_fut, mock_read_state_request_handler)
     })
     .await
     .unwrap_or_else(|_| panic!("long-poll getblocktemplate must not stall on {network}"));
@@ -1428,8 +1395,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
 
     snapshot_rpc_getblocktemplate("invalid-proposal", get_block_template, None, &settings);
 
-    // Mainnet still accepts verifier-approved proposals without the reserve preflight.
-    // Public Testnet requires the live parent even before NU7, because reissuance is scheduled.
+    // Scheduled reissuance requires a current-parent preflight, even before activation.
     let proposal = network.blockchain_map()[&1].to_vec();
     let mut proposal_read_state = read_state.clone();
     let get_block_template = rpc_mock_state.get_block_template(Some(GetBlockTemplateParameters {
@@ -1438,7 +1404,7 @@ pub async fn test_mining_rpcs<State, ReadState>(
         ..Default::default()
     }));
     tokio::time::timeout(Duration::from_secs(10), async {
-        if network.is_mainnet() {
+        if network.nsm_reissuance_height().is_none() {
             let verifier_response = async {
                 mock_block_verifier_router
                     .expect_request_that(|request| matches!(request, Request::CheckProposal(_)))
@@ -1458,8 +1424,14 @@ pub async fn test_mining_rpcs<State, ReadState>(
                 "Mainnet proposal validation must not request state"
             );
         } else {
-            let (response, ()) =
-                tokio::join!(get_block_template, make_mock_read_state_request_handler());
+            let mut proposal_read_state = read_state.clone();
+            let proposal_state_response = async {
+                proposal_read_state
+                    .expect_request(ReadRequest::ChainInfo)
+                    .await
+                    .respond(ReadResponse::ChainInfo(chain_info.clone()));
+            };
+            let (response, ()) = tokio::join!(get_block_template, proposal_state_response);
             assert!(matches!(
                 response.unwrap(),
                 GetBlockTemplateResponse::ProposalMode(BlockProposalResponse::Rejected(_)),
@@ -1523,7 +1495,13 @@ pub async fn test_mining_rpcs<State, ReadState>(
     // This RPC snapshot uses both the mock and populated states
 
     // Fake the ChainInfo response using the mock state
-    let mock_read_state_request_handler = make_mock_read_state_request_handler();
+    let mut difficulty_read_state = read_state.clone();
+    let mock_read_state_request_handler = async move {
+        difficulty_read_state
+            .expect_request(ReadRequest::ChainInfo)
+            .await
+            .respond(ReadResponse::ChainInfo(chain_info));
+    };
 
     let get_difficulty_fut = rpc_mock_state.get_difficulty();
 
