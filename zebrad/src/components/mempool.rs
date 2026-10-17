@@ -274,9 +274,8 @@ impl ActiveState {
 }
 
 /// Wake the background queue checker as well as the current service caller.
-#[derive(Default)]
-pub(crate) struct BackgroundWork {
-    pub(super) notify: tokio::sync::Notify,
+struct BackgroundWork {
+    notify: Arc<Notify>,
     original: futures::task::AtomicWaker,
 }
 
@@ -369,7 +368,7 @@ pub struct Mempool {
     #[cfg(feature = "progress-bar")]
     rejected_count_bar: Option<howudoin::Tx>,
 
-    /// Wakes the queue checker to store and announce verified transactions.
+    /// Wakes the queue checker for downloads and retained background work.
     transaction_verified: Arc<Notify>,
 }
 
@@ -405,12 +404,8 @@ impl Mempool {
             tokio::sync::broadcast::channel(gossip::MAX_CHANGES_BEFORE_SEND * 2);
         let transaction_subscriber = MempoolTxSubscriber::new(transaction_sender.clone());
         let transaction_verified = Arc::new(Notify::new());
-        let admission = admission::Admission::new(
-            network.clone(),
-            read_state.clone(),
-            block_verifier.clone(),
-            config.admission_split_width,
-        );
+        let admission =
+            admission::Admission::new(network.clone(), read_state.clone(), block_verifier.clone());
         let (block_templates, template_receiver, template_requests) =
             block_template::BlockTemplates::new(
                 network.clone(),
@@ -435,7 +430,10 @@ impl Mempool {
             transaction_verified: transaction_verified.clone(),
             block_templates,
             admission,
-            background_work: Arc::default(),
+            background_work: Arc::new(BackgroundWork {
+                notify: transaction_verified.clone(),
+                original: futures::task::AtomicWaker::new(),
+            }),
             #[cfg(feature = "progress-bar")]
             queued_count_bar: None,
             #[cfg(feature = "progress-bar")]
@@ -458,11 +456,6 @@ impl Mempool {
             template_receiver,
             template_requests,
         )
-    }
-
-    /// Return the wakeup source used by the background queue checker.
-    pub(crate) fn background_work(&self) -> Arc<BackgroundWork> {
-        self.background_work.clone()
     }
 
     /// Is the mempool enabled by a debug config option?
@@ -682,7 +675,7 @@ impl Mempool {
     }
 
     /// Drive template production without making ordinary mempool requests wait for it.
-    fn poll_templates(&mut self, cx: &mut Context<'_>) -> Result<(), BoxError> {
+    fn poll_templates(&mut self, cx: &mut Context<'_>) {
         let storage = match &self.active_state {
             ActiveState::Disabled => None,
             ActiveState::Enabled {
@@ -691,13 +684,8 @@ impl Mempool {
                 ..
             } => Some((storage, *last_seen_tip_hash)),
         };
-        if let Poll::Ready(Err(error)) =
-            self.block_templates
-                .poll(cx, storage, self.latest_chain_tip.best_tip_hash())
-        {
-            return Err(error);
-        }
-        Ok(())
+        self.block_templates
+            .poll(cx, storage, self.latest_chain_tip.best_tip_hash());
     }
 }
 
@@ -730,7 +718,7 @@ impl Service<Request> for Mempool {
         // Otherwise, callers could block waiting for the mempool to be enabled.
         if !self.is_enabled() {
             self.update_metrics();
-            self.poll_templates(cx)?;
+            self.poll_templates(cx);
 
             return Poll::Ready(Ok(()));
         }
@@ -797,7 +785,7 @@ impl Service<Request> for Mempool {
             }
 
             self.update_metrics();
-            self.poll_templates(cx)?;
+            self.poll_templates(cx);
 
             return Poll::Ready(Ok(()));
         }
@@ -1042,7 +1030,7 @@ impl Service<Request> for Mempool {
         }
 
         self.update_metrics();
-        self.poll_templates(cx)?;
+        self.poll_templates(cx);
 
         Poll::Ready(Ok(()))
     }

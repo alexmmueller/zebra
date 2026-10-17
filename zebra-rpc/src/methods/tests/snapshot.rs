@@ -1259,7 +1259,8 @@ pub async fn test_mining_rpcs<State, ReadState>(
         LongPollInput::new(fake_tip_height, fake_tip_hash, fake_max_time, []).generate_id(),
         vec![],
         None,
-    );
+    )
+    .unwrap();
     let make_mock_read_state_request_handler = || {
         let mut read_state = read_state.clone();
         async move {
